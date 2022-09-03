@@ -125,8 +125,8 @@ void windowing(wl_display* display, wl_registry* registry, auto const& globals) 
 
 void rendering(sycl::queue* const que,
                uint32_t* const pixels,
-               sycl::range<2> dim,
-               std::vector<std::complex<int>> const& vertices) noexcept;
+               sycl::range<3> dim,
+               std::vector<std::complex<float>> const& vertices) noexcept;
 
 int main() {
     if (auto display = attach_unique(wl_display_connect(nullptr))) {
@@ -266,19 +266,22 @@ void windowing(wl_display* display, wl_registry* registry, auto const& globals) 
         return ;
     }
     auto pointer_ptr = attach_unique(pointer);
-    std::vector<std::complex<int>> vertices{{}};
+    std::vector<std::complex<float>> vertices{{}};
     assert(vertices.empty() == false);
     wl_pointer_listener pointer_listener {
         .enter = [](auto...) noexcept { },
         .leave = [](auto...) noexcept { },
         .motion = [](auto data, auto, auto time, auto x, auto y) noexcept {
-            auto vertices = reinterpret_cast<std::vector<std::complex<int>>*>(data);
+            auto vertices = reinterpret_cast<std::vector<std::complex<float>>*>(data);
             auto& cursor = vertices->back();
-            cursor = { wl_fixed_to_double(x), wl_fixed_to_double(y) };
+            cursor = {
+                static_cast<float>(wl_fixed_to_double(x)),
+                static_cast<float>(wl_fixed_to_double(y)),
+            };
         },
         .button = [](auto data, auto, auto, auto, auto button, auto state) /*noexcept*/ {
             if (button == BTN_RIGHT && state) {
-                auto vertices = reinterpret_cast<std::vector<std::complex<int>>*>(data);
+                auto vertices = reinterpret_cast<std::vector<std::complex<float>>*>(data);
                 vertices->push_back(vertices->back());
             }
         },
@@ -331,7 +334,7 @@ void windowing(wl_display* display, wl_registry* registry, auto const& globals) 
     sycl::queue que;
     do {
         if (quit) break;
-        rendering(&que, pixels, {cy, cx}, vertices);
+        rendering(&que, pixels, {cy, cx, 4}, vertices);
         wl_surface_damage(surface, 0, 0, cx, cy);
         wl_surface_attach(surface, buffer, 0, 0);
         wl_surface_commit(surface);
@@ -339,72 +342,48 @@ void windowing(wl_display* display, wl_registry* registry, auto const& globals) 
     } while (wl_display_dispatch(display) != -1);
 }
 
-struct color {
-    uint32_t argb;
-    constexpr color(uint32_t argb) noexcept
-        : argb(argb)
-    {
-    }
-    constexpr color(std::byte x) noexcept
-        : argb((uint32_t)x << 24 | (uint32_t)x << 16 |(uint32_t)x << 8 | (uint32_t)x)
-    {
-    }
-    constexpr operator uint32_t() const noexcept { return this->argb; }
-    uint32_t a() const noexcept {
-        return (uint32_t) *(reinterpret_cast<std::byte const*>(this) + 3);
-    }
-    uint32_t r() const noexcept {
-        return (uint32_t) *(reinterpret_cast<std::byte const*>(this) + 2);
-    }
-    uint32_t g() const noexcept {
-        return (uint32_t) *(reinterpret_cast<std::byte const*>(this) + 1);
-    }
-    uint32_t b() const noexcept {
-        return (uint32_t) *(reinterpret_cast<std::byte const*>(this) + 0);
-    }
-    color& operator*=(color src) noexcept {
-        auto& dst = *this;
-        auto q = (255 - src.a());
-        auto a = std::min(255u, src.a() + ((dst.a() * q) / 255));
-        auto r = std::min(255u, src.r() + ((dst.r() * q) / 255));
-        auto g = std::min(255u, src.g() + ((dst.g() * q) / 255));
-        auto b = std::min(255u, src.b() + ((dst.b() * q) / 255));
-        this->argb = a << 24 | r << 16 | g << 8 | b;
-        return *this;
-    }
-};
-
 void rendering(sycl::queue* const que,
                uint32_t* const pixels,
-               sycl::range<2> dim,
-               std::vector<std::complex<int>> const& vertices) noexcept
+               sycl::range<3> dim,
+               std::vector<std::complex<float>> const& vertices) noexcept
 {
-    auto pix = sycl::buffer{pixels, dim};
-    auto pts = sycl::buffer<std::complex<int>>{&vertices.front(), vertices.size()};
+    auto pix = sycl::buffer<uint8_t, 3>{reinterpret_cast<uint8_t*>(pixels), dim};
+    auto pts = sycl::buffer<std::complex<float>>{&vertices.front(), vertices.size()};
     que->submit([&](sycl::handler& h) noexcept {
         auto a = pix.get_access<sycl::access::mode::write>(h);
         h.parallel_for(dim, [=](auto idx) noexcept {
-            a[idx] = 0xcc000000;
+            switch (idx[2]) {
+            case 3:
+                a[idx] = 0xc0;
+                break;
+            default:
+                a[idx] = 0x00;
+                break;
+            }
         });
     });
-    que->submit([&](sycl::handler& h) noexcept {
-        constexpr float phi = std::numbers::phi_v<float>;
-        constexpr float tau = std::numbers::pi_v<float> * 2.0f;
-        size_t P = 16;
-        size_t M = (1 << P);
+    constexpr float phi = std::numbers::phi_v<float>;
+    constexpr float tau = std::numbers::pi_v<float> * 2.0f;
+    size_t P = 16;
+    size_t M = (1 << P);
+    que->submit([&](auto& h) noexcept {
         auto apx = pix.get_access<sycl::access::mode::read_write>(h);
         auto apt = pts.get_access<sycl::access::mode::read>(h);
         h.parallel_for(vertices.size() << P, [=](auto idx) noexcept {
             int n = idx >> P;
             int m = idx & (M - 1);
-            std::complex<float> pt = {
-                static_cast<float>(apt[n].real()),
-                static_cast<float>(apt[n].imag()),
-            };
-            pt += std::polar<float>(std::sqrt(m)/1.0f, m*tau*phi);
-            color dst = apx[{(unsigned) pt.imag(), (unsigned) pt.real()}];
-            dst *= color((std::byte) (255 - m * 255 / (M-1)));
-            apx[{(unsigned) pt.imag(), (unsigned) pt.real()}] = dst;
+            std::complex<float> pt(apt[n].real(), apt[n].imag());
+            pt += std::polar<float>(std::sqrt(m)/3.0f, m*tau*phi);
+            auto x = static_cast<unsigned>(pt.real());
+            auto y = static_cast<unsigned>(pt.imag());
+            auto& a = apx[{ y, x, 3 }];
+            auto& r = apx[{ y, x, 2 }];
+            auto& g = apx[{ y, x, 1 }];
+            auto& b = apx[{ y, x, 0 }];
+            a = std::max<uint8_t>(a, (uint8_t) (255 - m * 255 / (M-1)));
+            r = std::max<uint8_t>(r, (uint8_t) (255 - m * 255 / (M-1)));
+            g = std::max<uint8_t>(g, (uint8_t) (255 - m * 255 / (M-1)));
+            b = std::max<uint8_t>(b, (uint8_t) (255 - m * 255 / (M-1)));
         });
     });
 }
